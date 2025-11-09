@@ -931,7 +931,10 @@ def print_summary_table():
     print("SENSITIVITY ANALYSIS SUMMARY - KEY DESIGN MARGINS")
     print("="*100)
     
-    margins_to_analyze = [10, 12, 15, 18, 20, 22, 25, 30]
+    # Include current design margin (rounded) in analysis
+    current_margin_rounded = int(round(CURRENT_DESIGN_MARGIN_PCT))
+    margins_to_analyze = [10, 12, 15, 18, 20, 22, 25, 30, current_margin_rounded]
+    margins_to_analyze = sorted(list(set(margins_to_analyze)))  # Remove duplicates and sort
     
     print(f"\n{'Margin':<8} {'Motor':<10} {'Motor':<10} {'Motor':<10} {'Annual':<12} {'CAPEX':<12} "
           f"{'NPV OPEX':<12} {'Total LC':<12} {'CO2/yr':<10}")
@@ -956,7 +959,7 @@ def print_summary_table():
         marker = ""
         if margin == 15:
             marker = "API 560"
-        elif margin == 25:
+        elif margin == current_margin_rounded:
             marker = "CURRENT"
         elif margin <= 12:
             marker = "Best Practice"
