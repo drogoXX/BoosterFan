@@ -67,9 +67,23 @@ maintenance_cost_rate = 0.03  # Annual maintenance as fraction of CAPEX (3%)
 # System curve parameters
 # Real systems have both static and dynamic pressure components
 # P_system = P_static + k * Q^2
-# Calculate from known operating points
-system_static_pressure = 10.0  # mbar (estimated static pressure component)
-system_dynamic_coeff = (pressure_cclpa - system_static_pressure) / (flow_cclpa ** 2)  # mbar/(m³/h)²
+# Calculate from known operating points (CCLPA and CCLPB)
+# Using two points to solve for P_static and k:
+#   P_cclpa = P_static + k * Q_cclpa²
+#   P_cclpb = P_static + k * Q_cclpb²
+# Solving: k = (P_cclpb - P_cclpa) / (Q_cclpb² - Q_cclpa²)
+#          P_static = P_cclpa - k * Q_cclpa²
+
+system_dynamic_coeff = (pressure_cclpb - pressure_cclpa) / (flow_cclpb ** 2 - flow_cclpa ** 2)  # mbar/(m³/h)²
+system_static_pressure = pressure_cclpa - system_dynamic_coeff * (flow_cclpa ** 2)  # mbar
+
+# Validate: static pressure should be >= 0 (physical constraint)
+if system_static_pressure < 0:
+    # If negative, system is purely dynamic (no static component)
+    print(f"Warning: Calculated static pressure is negative ({system_static_pressure:.2f} mbar). "
+          f"Assuming purely dynamic system (P_static = 0).")
+    system_static_pressure = 0.0
+    system_dynamic_coeff = pressure_cclpa / (flow_cclpa ** 2)
 
 # Operating profile (part-load distribution)
 # Represents typical plant operation: % of time at each load point
@@ -78,6 +92,18 @@ operating_profile = {
     'cclpa': {'flow': flow_cclpa, 'pressure': pressure_cclpa, 'hours_per_year': 7760},  # 97% of time
     'cclpb': {'flow': flow_cclpb, 'pressure': pressure_cclpb, 'hours_per_year': 160},  # 2% of time
 }
+
+# Validate operating profile hours
+_total_profile_hours = sum(op['hours_per_year'] for op in operating_profile.values())
+if abs(_total_profile_hours - operating_hours) > 1:  # Allow 1 hour tolerance for rounding
+    raise ValueError(
+        f"Operating profile hours ({_total_profile_hours}) do not match "
+        f"total operating hours ({operating_hours}). "
+        f"Please adjust the profile to sum to {operating_hours} hours/year."
+    )
+
+# CURRENT DESIGN MARGIN - Single source of truth
+CURRENT_DESIGN_MARGIN_PCT = 31.7  # Current design is 132% of CCLPA (1.317 = 1 + 0.317)
 
 # ============================================================================
 # FAN AFFINITY LAWS
@@ -106,43 +132,106 @@ def generate_fan_curve(rpm, base_rpm=1500):
     """
     # Base curve at 1500 RPM - polynomial approximation
     # Typical fan curve: ΔP = a - b*Q² (shutoff head to free delivery)
-    
+
     # Use design point as reference (at 100% RPM)
     Q_ref = flow_design
     P_ref = pressure_design
-    
+
     # Generate curve points (0 to 120% of design flow)
     Q_range = np.linspace(0, Q_ref * 1.2, 100)
-    
+
     # Polynomial fan curve: P = P_shutoff - k*Q²
     # At design point: P_ref = P_shutoff - k*Q_ref²
     # At free delivery: P = 0, Q = Q_max
     # Assume Q_max = 1.3 * Q_ref (typical for centrifugal fans)
     Q_max_base = Q_ref * 1.3
-    
-    # Calculate coefficients
-    P_shutoff_base = P_ref / (1 - (Q_ref / Q_max_base) ** 2)
+
+    # Calculate coefficients with protection against division by zero
+    ratio_squared = (Q_ref / Q_max_base) ** 2
+    if ratio_squared >= 0.99:  # Protection: if Q_ref too close to Q_max
+        raise ValueError(f"Q_ref ({Q_ref}) too close to Q_max ({Q_max_base}). Adjust Q_max multiplier.")
+
+    P_shutoff_base = P_ref / (1 - ratio_squared)
     k = P_shutoff_base / (Q_max_base ** 2)
-    
+
     # Base pressure curve at reference RPM
     P_base = P_shutoff_base - k * Q_range ** 2
     P_base[P_base < 0] = 0  # No negative pressure
-    
+
     # Apply affinity laws for actual RPM
     rpm_ratio = rpm / base_rpm
     Q_actual = Q_range * rpm_ratio
     P_actual = P_base * (rpm_ratio ** 2)
-    
+
     # Efficiency curve (parabolic, peaks around 70% of Q_max)
     Q_peak_eff = Q_ref * 0.95  # Peak efficiency near design point
     eff_peak = 85.0  # Peak efficiency
-    
+
     # Gaussian-like efficiency curve
     efficiency = eff_peak * np.exp(-((Q_range - Q_peak_eff) ** 2) / (2 * (Q_peak_eff * 0.4) ** 2))
     efficiency = efficiency * rpm_ratio ** 0.1  # Slight efficiency loss at lower RPM
     efficiency = np.clip(efficiency, 0, 90)  # Cap at realistic values
-    
+
     return Q_actual, P_actual, efficiency
+
+
+def get_fan_efficiency_at_operating_point(flow_m3h, pressure_mbar, rpm_values=[1200, 1350, 1500]):
+    """
+    Interpolate fan efficiency at a given operating point (flow, pressure)
+    by finding the best matching RPM curve and interpolating efficiency
+
+    Args:
+        flow_m3h: Volumetric flow rate in m³/h
+        pressure_mbar: Pressure rise in mbar
+        rpm_values: List of RPM curves to consider
+
+    Returns:
+        Interpolated fan efficiency in % (0-100)
+    """
+    best_rpm = rpm_values[-1]  # Default to highest RPM
+    min_pressure_diff = float('inf')
+
+    # Generate curves for all RPM values
+    curves = {}
+    for rpm in rpm_values:
+        Q, P, eff = generate_fan_curve(rpm)
+        curves[rpm] = (Q, P, eff)
+
+    # Find which RPM curve the operating point is closest to
+    # by checking which curve gives pressure closest to target at the given flow
+    for rpm in rpm_values:
+        Q, P, eff = curves[rpm]
+
+        # Check if flow is within curve range
+        if flow_m3h < Q[0] or flow_m3h > Q[-1]:
+            continue
+
+        # Interpolate pressure at this flow on this RPM curve
+        pressure_at_flow = np.interp(flow_m3h, Q, P)
+
+        # Check how close the pressure matches
+        pressure_diff = abs(pressure_at_flow - pressure_mbar)
+
+        if pressure_diff < min_pressure_diff:
+            min_pressure_diff = pressure_diff
+            best_rpm = rpm
+
+    # Get efficiency from the best matching curve
+    Q_best, P_best, eff_best = curves[best_rpm]
+
+    # Interpolate efficiency at the target flow
+    if flow_m3h < Q_best[0]:
+        efficiency_pct = eff_best[0]  # Use first point
+    elif flow_m3h > Q_best[-1]:
+        efficiency_pct = eff_best[-1]  # Use last point
+    else:
+        efficiency_pct = np.interp(flow_m3h, Q_best, eff_best)
+
+    # Ensure realistic range
+    efficiency_pct = np.clip(efficiency_pct, 30, 90)
+
+    return float(efficiency_pct)
+
 
 # ============================================================================
 # MOTOR EFFICIENCY CURVE
@@ -151,31 +240,35 @@ def generate_fan_curve(rpm, base_rpm=1500):
 def motor_efficiency_curve(load_percent):
     """
     Calculate motor efficiency as function of load percentage
-    Based on typical large induction motor efficiency curves
+    Based on typical large induction motor efficiency curves (IE3/IE4 class)
+
+    Peak efficiency occurs around 75-85% load, then plateaus or slightly decreases.
+    Efficiency drops significantly below 50% load.
     """
     # Convert to array if single value
     load = np.atleast_1d(load_percent)
-    
-    # Typical efficiency curve (peaks around 75-80% load)
+
+    # Typical efficiency curve (peaks around 75-85% load)
     eff = np.zeros_like(load)
-    
+
     for i, L in enumerate(load):
         if L < 25:
-            # Very poor efficiency at low loads
-            eff[i] = 0.60 + 0.008 * L
+            # Very poor efficiency at low loads (25% load = ~78%)
+            eff[i] = 0.60 + 0.0072 * L
         elif L < 50:
-            # Improving efficiency
-            eff[i] = 0.80 + 0.004 * (L - 25)
+            # Improving efficiency (50% load = ~90%)
+            eff[i] = 0.78 + 0.0048 * (L - 25)
         elif L < 75:
-            # Near optimal efficiency
-            eff[i] = 0.90 + 0.002 * (L - 50)
+            # Approaching peak (75% load = ~95%)
+            eff[i] = 0.90 + 0.0020 * (L - 50)
         elif L <= 100:
-            # Peak efficiency region
-            eff[i] = 0.95 + 0.00048 * (L - 75)
+            # Peak efficiency region - plateau at ~95-96%
+            # Efficiency plateaus, doesn't continue rising
+            eff[i] = 0.95 + 0.0004 * (L - 75)
         else:
-            # Overload region (slight decrease)
-            eff[i] = 0.962 - 0.0005 * (L - 100)
-    
+            # Overload region (efficiency decreases)
+            eff[i] = max(0.96 - 0.001 * (L - 100), 0.85)
+
     return eff if isinstance(load_percent, np.ndarray) else eff[0]
 
 def vfd_efficiency_curve(load_percent, speed_percent=None):
@@ -183,32 +276,47 @@ def vfd_efficiency_curve(load_percent, speed_percent=None):
     Calculate VFD efficiency as function of load percentage
     VFD efficiency typically: 97-98% at full load, drops at part load
     If speed_percent is provided, accounts for speed-dependent losses
+
+    Args:
+        load_percent: Motor load as percentage (0-100+) - scalar, list, or numpy array
+        speed_percent: Speed as fraction (0-1.0), optional. If None, estimated from load.
+
+    Returns:
+        VFD efficiency as fraction (0.90-0.98) - same type as input
     """
-    load = np.atleast_1d(load_percent)
-    
+    # Store original type for return
+    input_is_scalar = isinstance(load_percent, (int, float, np.number))
+
+    # Convert to numpy array for vectorized operations
+    load = np.atleast_1d(np.asarray(load_percent, dtype=float))
+
     if speed_percent is None:
         # Estimate speed from load (assuming cubic relationship: P ∝ N³)
-        speed_percent = (load / 100) ** (1/3) * 100
+        speed_percent = (load / 100) ** (1/3)
     else:
-        speed_percent = np.atleast_1d(speed_percent) * 100
-    
+        speed_percent = np.atleast_1d(np.asarray(speed_percent, dtype=float))
+
+    # Ensure speed_percent is in 0-1 range (convert from % if needed)
+    if np.any(speed_percent > 1.5):
+        speed_percent = speed_percent / 100
+
     # Base VFD efficiency (full load, full speed)
     eff_base = 0.98
-    
+
     # Efficiency drops with speed (due to switching losses)
     # At 50% speed: ~95% efficiency, at 25% speed: ~92% efficiency
-    speed_factor = 0.98 - 0.00012 * (100 - speed_percent)
-    
+    speed_factor = 0.98 - 0.00012 * (100 - speed_percent * 100)
+
     # Efficiency also drops slightly at very low loads (<30%)
     load_factor = np.ones_like(load)
     load_factor[load < 30] = 0.99 - 0.003 * (30 - load[load < 30])
-    
+
     eff = eff_base * speed_factor * load_factor
     eff = np.clip(eff, 0.90, 0.98)  # Realistic range
-    
-    # Return scalar if input was scalar, array if input was array
-    if isinstance(load_percent, (int, float)):
-        return float(eff[0] if hasattr(eff, '__len__') and len(eff) == 1 else eff)
+
+    # Return same type as input
+    if input_is_scalar:
+        return float(eff[0])
     else:
         return eff
 
@@ -253,18 +361,13 @@ def calculate_lifecycle_cost(design_margin_pct, verbose=False, use_part_load_pro
     """
     # Design flow based on margin over nominal
     flow_design_case = flow_cclpa * (1 + design_margin_pct / 100)
-    
+
     # Estimate pressure rise using improved system curve
     pressure_design_case = calculate_system_pressure(flow_design_case, flow_cclpa, pressure_cclpa)
-    
-    # Estimate efficiency (slightly better at lower margins due to better fan selection)
-    if design_margin_pct <= 15:
-        eff_design = 84
-    elif design_margin_pct <= 20:
-        eff_design = 83
-    else:
-        eff_design = 82
-    
+
+    # Get efficiency from actual fan curves at design point
+    eff_design = get_fan_efficiency_at_operating_point(flow_design_case, pressure_design_case)
+
     # Fan power at design point
     power_fan_design = calculate_fan_power(flow_design_case, pressure_design_case, eff_design)
     
@@ -279,49 +382,61 @@ def calculate_lifecycle_cost(design_margin_pct, verbose=False, use_part_load_pro
     if use_part_load_profile:
         annual_energy_kwh = 0
         annual_opex_energy = 0
-        
+        # Store motor load data to avoid duplicate calculations later
+        motor_load_data = []
+
         for op_point in operating_profile.values():
             flow_op = op_point['flow']
             pressure_op = op_point['pressure']
             hours = op_point['hours_per_year']
-            
-            # Estimate fan efficiency at this operating point (simplified)
-            # In reality, this should interpolate from fan curve
-            eff_op = 80.0  # Assume 80% efficiency at operating points
-            
+
+            # Get fan efficiency from actual fan curves at this operating point
+            eff_op = get_fan_efficiency_at_operating_point(flow_op, pressure_op)
+
             # Fan power at this operating point
             power_fan_op = calculate_fan_power(flow_op, pressure_op, eff_op)
-            
+
             # Motor load percentage
             motor_load_pct_op = (power_fan_op / motor_rated) * 100
-            
+
+            # Store for weighted average calculation (avoid duplicate calculation)
+            motor_load_data.append({
+                'motor_load_pct': motor_load_pct_op,
+                'hours': hours
+            })
+
             # Motor efficiency
             motor_eff_op = motor_efficiency_curve(motor_load_pct_op)
-            
-            # Estimate speed percentage (from flow ratio, assuming cubic relationship)
+
+            # Estimate speed percentage from flow ratio
+            # Per affinity laws: Flow varies linearly with speed (Q ∝ N)
+            # Therefore: N/N_design = Q/Q_design
             speed_pct_op = (flow_op / flow_design_case) * 100
-            
+
             # VFD efficiency
             vfd_eff_op = vfd_efficiency_curve(motor_load_pct_op, speed_pct_op/100)
-            
+
             # Total system efficiency (fan × motor × VFD)
             total_eff_op = (eff_op / 100) * motor_eff_op * vfd_eff_op
-            
+
             # Motor input power
             motor_input_power_op = power_fan_op / (motor_eff_op * vfd_eff_op)
-            
+
             # Energy consumption at this operating point
             energy_op = motor_input_power_op * hours
             annual_energy_kwh += energy_op
-        
+
         # Annual operating cost (energy only, maintenance added separately)
         annual_opex_energy = annual_energy_kwh * electricity_cost
         
     else:
         # Original method: assume 100% operation at nominal
-        power_fan_nominal = calculate_fan_power(flow_cclpa, pressure_cclpa, 80)
+        # Get fan efficiency from actual curves at nominal operating point
+        eff_nominal = get_fan_efficiency_at_operating_point(flow_cclpa, pressure_cclpa)
+        power_fan_nominal = calculate_fan_power(flow_cclpa, pressure_cclpa, eff_nominal)
         motor_load_pct = (power_fan_nominal / motor_rated) * 100
         motor_eff = motor_efficiency_curve(motor_load_pct)
+        # Speed ratio: Flow varies linearly with speed (affinity law)
         speed_pct_nominal = (flow_cclpa / flow_design_case) * 100
         vfd_eff = vfd_efficiency_curve(motor_load_pct, speed_pct_nominal/100)
         motor_input_power = power_fan_nominal / (motor_eff * vfd_eff)
@@ -354,16 +469,10 @@ def calculate_lifecycle_cost(design_margin_pct, verbose=False, use_part_load_pro
     
     # Calculate average motor load for reporting (weighted by operating hours)
     if use_part_load_profile:
-        total_hours = sum(op['hours_per_year'] for op in operating_profile.values())
-        weighted_load = 0
-        for op_point in operating_profile.values():
-            flow_op = op_point['flow']
-            pressure_op = op_point['pressure']
-            hours = op_point['hours_per_year']
-            eff_op = 80.0
-            power_fan_op = calculate_fan_power(flow_op, pressure_op, eff_op)
-            motor_load_pct_op = (power_fan_op / motor_rated) * 100
-            weighted_load += motor_load_pct_op * (hours / total_hours)
+        # Use previously calculated motor load data (no duplicate calculation)
+        total_hours = sum(data['hours'] for data in motor_load_data)
+        weighted_load = sum(data['motor_load_pct'] * data['hours'] / total_hours
+                           for data in motor_load_data)
         avg_motor_load_pct = weighted_load
         avg_motor_eff = motor_efficiency_curve(avg_motor_load_pct)
     else:
@@ -440,8 +549,8 @@ def create_comprehensive_plots():
     ax1.plot(system_flows/1000, system_pressures, 'k--', linewidth=2, 
             alpha=0.5, label='System Curve', zorder=3)
     
-    # Current Design point (132% CCLPA = 31.7% margin)
-    flow_current = flow_cclpa * 1.317
+    # Current Design point
+    flow_current = flow_cclpa * (1 + CURRENT_DESIGN_MARGIN_PCT / 100)
     pressure_current = calculate_system_pressure(flow_current, flow_cclpa, pressure_cclpa)
     
     # Plot Current Design point
@@ -529,8 +638,8 @@ def create_comprehensive_plots():
                     best_rpm = rpm
         return best_rpm
     
-    # Add Current Design point (132% CCLPA) - determine which RPM curve it's on
-    flow_current = flow_cclpa * 1.317
+    # Add Current Design point - determine which RPM curve it's on
+    flow_current = flow_cclpa * (1 + CURRENT_DESIGN_MARGIN_PCT / 100)
     pressure_current = calculate_system_pressure(flow_current, flow_cclpa, pressure_cclpa)
     best_rpm_current = find_best_rpm_curve(flow_current, pressure_current, curve_data, rpm_values)
     eff_current = get_efficiency_at_flow(flow_current, best_rpm_current, curve_data)
@@ -582,7 +691,7 @@ def create_comprehensive_plots():
     ax3.axvspan(60, 80, alpha=0.15, color='green', label='Optimal Load Range')
     
     # Mark current design operating point
-    current_results = calculate_lifecycle_cost(31.7, use_part_load_profile=True)
+    current_results = calculate_lifecycle_cost(CURRENT_DESIGN_MARGIN_PCT, use_part_load_profile=True)
     ax3.scatter(current_results['motor_load_pct'], 
                current_results['motor_efficiency'] * 100,
                s=200, c='red', marker='X', edgecolors='black', 
@@ -616,14 +725,14 @@ def create_comprehensive_plots():
     
     # Mark key points
     api_idx = np.argmin(np.abs(margins - 15))
-    current_idx = np.argmin(np.abs(margins - 32))  # 31.7% rounded to 32% for closest match
+    current_idx = np.argmin(np.abs(margins - CURRENT_DESIGN_MARGIN_PCT))
     
     # Mark API 560 point (plotted but not in legend)
     ax4.scatter(15, total_costs[api_idx]/1000, s=300, c='purple', 
                marker='*', edgecolors='black', linewidth=2, 
                zorder=5)
     # Mark Current Design point (plotted but not in legend)
-    ax4.scatter(32, total_costs[current_idx]/1000, s=250, c='red', 
+    ax4.scatter(CURRENT_DESIGN_MARGIN_PCT, total_costs[current_idx]/1000, s=250, c='red', 
                marker='X', edgecolors='black', linewidth=2, 
                zorder=5)
     
@@ -648,9 +757,9 @@ def create_comprehensive_plots():
     ax5.plot(margins, np.array(annual_opex)/1000, linewidth=3, 
             color='#bcbd22', marker='s', markersize=4)
     
-    ax5.scatter(15, annual_opex[api_idx]/1000, s=300, c='purple', 
+    ax5.scatter(15, annual_opex[api_idx]/1000, s=300, c='purple',
                marker='*', edgecolors='black', linewidth=2, zorder=5)
-    ax5.scatter(32, annual_opex[current_idx]/1000, s=250, c='red', 
+    ax5.scatter(CURRENT_DESIGN_MARGIN_PCT, annual_opex[current_idx]/1000, s=250, c='red', 
                marker='X', edgecolors='black', linewidth=2, zorder=5)
     
     ax5.axvspan(10, 15, alpha=0.2, color='green')
@@ -670,9 +779,9 @@ def create_comprehensive_plots():
     ax6.plot(margins, motor_loads, linewidth=3, color='#17becf', 
             marker='d', markersize=4)
     
-    ax6.scatter(15, motor_loads[api_idx], s=300, c='purple', 
+    ax6.scatter(15, motor_loads[api_idx], s=300, c='purple',
                marker='*', edgecolors='black', linewidth=2, zorder=5)
-    ax6.scatter(32, motor_loads[current_idx], s=250, c='red', 
+    ax6.scatter(CURRENT_DESIGN_MARGIN_PCT, motor_loads[current_idx], s=250, c='red', 
                marker='X', edgecolors='black', linewidth=2, zorder=5)
     
     # Optimal load range
@@ -698,9 +807,9 @@ def create_comprehensive_plots():
     ax7.plot(margins, co2_emissions, linewidth=3, color='#8c564b', 
             marker='h', markersize=4)
     
-    ax7.scatter(15, co2_emissions[api_idx], s=300, c='purple', 
+    ax7.scatter(15, co2_emissions[api_idx], s=300, c='purple',
                marker='*', edgecolors='black', linewidth=2, zorder=5)
-    ax7.scatter(32, co2_emissions[current_idx], s=250, c='red', 
+    ax7.scatter(CURRENT_DESIGN_MARGIN_PCT, co2_emissions[current_idx], s=250, c='red', 
                marker='X', edgecolors='black', linewidth=2, zorder=5)
     
     ax7.axvspan(10, 15, alpha=0.2, color='green')
@@ -715,8 +824,8 @@ def create_comprehensive_plots():
     # ========================================================================
     ax8 = fig.add_subplot(gs[2, 2])
     
-    # Compare three scenarios: 10%, 15% (API), 32% (current - 31.7% rounded)
-    scenarios = [10, 15, 32]
+    # Compare three scenarios: 10%, 15% (API), Current Design
+    scenarios = [10, 15, int(round(CURRENT_DESIGN_MARGIN_PCT))]
     scenario_results = [calculate_lifecycle_cost(m, verbose=True, use_part_load_profile=True) for m in scenarios]
     
     labels = ['Best\nPractice\n(110% CCLPA)', 'API 560\n(115% CCLPA)', 'Current\n(132% CCLPA)']
@@ -898,7 +1007,7 @@ if __name__ == "__main__":
     print("RECOMMENDATION SUMMARY")
     print("="*80)
     
-    current = calculate_lifecycle_cost(31.7, use_part_load_profile=True)
+    current = calculate_lifecycle_cost(CURRENT_DESIGN_MARGIN_PCT, use_part_load_profile=True)
     api = calculate_lifecycle_cost(15, use_part_load_profile=True)
     optimal = calculate_lifecycle_cost(12, use_part_load_profile=True)
     
