@@ -18,6 +18,23 @@ ENHANCEMENTS (v2.0):
 - Maintenance costs included in lifecycle analysis
 - Consistent pressure calculations across all plots
 
+FIXES (v2.1):
+- Use actual fan curves for efficiency calculations (not hardcoded)
+- Added division-by-zero protection
+- Standardized design margin constant
+- Corrected motor efficiency curve shape
+- Fixed speed calculation documentation
+- Calculated system static pressure from data
+- Improved VFD efficiency type handling
+- Added operating hours validation
+- Removed duplicate calculations
+
+FIXES (v2.2):
+- Implemented bilinear interpolation for fan efficiency
+- Eliminates discontinuities/peaks in sensitivity analysis
+- Smooth interpolation across both flow and RPM dimensions
+- More accurate representation of VFD-controlled fan operation
+
 REQUIREMENTS:
     pip install matplotlib numpy --break-system-packages
 """
@@ -175,57 +192,99 @@ def generate_fan_curve(rpm, base_rpm=1500):
     return Q_actual, P_actual, efficiency
 
 
-def get_fan_efficiency_at_operating_point(flow_m3h, pressure_mbar, rpm_values=[1200, 1350, 1500]):
+def estimate_rpm_from_operating_point(flow_m3h, pressure_mbar, base_rpm=1500):
     """
-    Interpolate fan efficiency at a given operating point (flow, pressure)
-    by finding the best matching RPM curve and interpolating efficiency
+    Estimate the RPM required to achieve a given flow and pressure
+    using affinity laws and the base fan curve
+
+    Args:
+        flow_m3h: Target flow rate in m³/h
+        pressure_mbar: Target pressure rise in mbar
+        base_rpm: Base RPM for reference curve
+
+    Returns:
+        Estimated RPM required
+    """
+    # Use affinity laws: P ∝ (N/N_ref)² and Q ∝ (N/N_ref)
+    # At base RPM, get the pressure at this flow rate
+    Q_base, P_base, _ = generate_fan_curve(base_rpm)
+
+    # Interpolate pressure at target flow on base curve
+    if flow_m3h < Q_base[0]:
+        pressure_at_base_rpm = P_base[0]
+    elif flow_m3h > Q_base[-1]:
+        pressure_at_base_rpm = P_base[-1]
+    else:
+        pressure_at_base_rpm = np.interp(flow_m3h, Q_base, P_base)
+
+    # Affinity law: P_target / P_base = (N_target / N_base)²
+    # Therefore: N_target = N_base * sqrt(P_target / P_base)
+    if pressure_at_base_rpm > 0:
+        rpm_ratio = np.sqrt(pressure_mbar / pressure_at_base_rpm)
+        rpm_estimated = base_rpm * rpm_ratio
+    else:
+        rpm_estimated = base_rpm
+
+    # Ensure RPM is within reasonable bounds
+    rpm_estimated = np.clip(rpm_estimated, 800, 1600)
+
+    return rpm_estimated
+
+
+def get_fan_efficiency_at_operating_point(flow_m3h, pressure_mbar):
+    """
+    Smoothly interpolate fan efficiency at a given operating point (flow, pressure)
+    using bilinear interpolation across flow and RPM dimensions.
+
+    This eliminates discontinuities caused by discrete RPM curve selection.
 
     Args:
         flow_m3h: Volumetric flow rate in m³/h
         pressure_mbar: Pressure rise in mbar
-        rpm_values: List of RPM curves to consider
 
     Returns:
         Interpolated fan efficiency in % (0-100)
     """
-    best_rpm = rpm_values[-1]  # Default to highest RPM
-    min_pressure_diff = float('inf')
+    # Step 1: Estimate the RPM required for this operating point
+    rpm_required = estimate_rpm_from_operating_point(flow_m3h, pressure_mbar)
 
-    # Generate curves for all RPM values
-    curves = {}
-    for rpm in rpm_values:
-        Q, P, eff = generate_fan_curve(rpm)
-        curves[rpm] = (Q, P, eff)
+    # Step 2: Define a finer RPM grid for interpolation
+    rpm_grid = np.arange(1000, 1600, 100)  # Every 100 RPM for smooth interpolation
 
-    # Find which RPM curve the operating point is closest to
-    # by checking which curve gives pressure closest to target at the given flow
-    for rpm in rpm_values:
-        Q, P, eff = curves[rpm]
+    # Find bounding RPMs
+    rpm_lower_idx = np.searchsorted(rpm_grid, rpm_required) - 1
+    rpm_lower_idx = max(0, min(rpm_lower_idx, len(rpm_grid) - 2))
 
-        # Check if flow is within curve range
-        if flow_m3h < Q[0] or flow_m3h > Q[-1]:
-            continue
+    rpm_lower = rpm_grid[rpm_lower_idx]
+    rpm_upper = rpm_grid[rpm_lower_idx + 1]
 
-        # Interpolate pressure at this flow on this RPM curve
-        pressure_at_flow = np.interp(flow_m3h, Q, P)
+    # Step 3: Generate curves at both bounding RPMs
+    Q_lower, P_lower, eff_lower = generate_fan_curve(rpm_lower)
+    Q_upper, P_upper, eff_upper = generate_fan_curve(rpm_upper)
 
-        # Check how close the pressure matches
-        pressure_diff = abs(pressure_at_flow - pressure_mbar)
-
-        if pressure_diff < min_pressure_diff:
-            min_pressure_diff = pressure_diff
-            best_rpm = rpm
-
-    # Get efficiency from the best matching curve
-    Q_best, P_best, eff_best = curves[best_rpm]
-
-    # Interpolate efficiency at the target flow
-    if flow_m3h < Q_best[0]:
-        efficiency_pct = eff_best[0]  # Use first point
-    elif flow_m3h > Q_best[-1]:
-        efficiency_pct = eff_best[-1]  # Use last point
+    # Step 4: Interpolate efficiency at target flow on both curves
+    if flow_m3h < Q_lower[0]:
+        eff_at_lower_rpm = eff_lower[0]
+    elif flow_m3h > Q_lower[-1]:
+        eff_at_lower_rpm = eff_lower[-1]
     else:
-        efficiency_pct = np.interp(flow_m3h, Q_best, eff_best)
+        eff_at_lower_rpm = np.interp(flow_m3h, Q_lower, eff_lower)
+
+    if flow_m3h < Q_upper[0]:
+        eff_at_upper_rpm = eff_upper[0]
+    elif flow_m3h > Q_upper[-1]:
+        eff_at_upper_rpm = eff_upper[-1]
+    else:
+        eff_at_upper_rpm = np.interp(flow_m3h, Q_upper, eff_upper)
+
+    # Step 5: Interpolate between the two RPM curves
+    if rpm_lower == rpm_upper or abs(rpm_required - rpm_lower) < 1:
+        efficiency_pct = eff_at_lower_rpm
+    else:
+        # Linear interpolation between RPMs
+        weight_upper = (rpm_required - rpm_lower) / (rpm_upper - rpm_lower)
+        weight_lower = 1 - weight_upper
+        efficiency_pct = weight_lower * eff_at_lower_rpm + weight_upper * eff_at_upper_rpm
 
     # Ensure realistic range
     efficiency_pct = np.clip(efficiency_pct, 30, 90)
